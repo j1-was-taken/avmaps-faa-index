@@ -1,0 +1,98 @@
+name: Publish PMA index
+
+# Public repo avmaps-pma-index. Triggered by the avmaps import workflow
+# (repository_dispatch) right after it uploads the `pma-index` artifact.
+# Serves  https://<owner>.github.io/avmaps-pma-index/manifest.json
+#         https://<owner>.github.io/avmaps-pma-index/idx-<v>.bin.gz
+on:
+  repository_dispatch:
+    types: [pma-index-built]
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Source repo (owner/name), e.g. owner/avmaps"
+        required: true
+      run_id:
+        description: "Run id of the import workflow that uploaded pma-index (artifact lives 1 day)"
+        required: true
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Download artifact → compare with live
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.compare.outputs.skip }}
+    steps:
+      - name: Download pma-index artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pma-index
+          path: site
+          repository: ${{ github.event.client_payload.repo || inputs.repo }}
+          run-id: ${{ github.event.client_payload.run_id || inputs.run_id }}
+          github-token: ${{ secrets.AVMAPS_ARTIFACT_TOKEN }}
+
+      - name: Validate artifact
+        id: new
+        run: |
+          set -euo pipefail
+          test -f site/manifest.json
+          V=$(jq -er '.v' site/manifest.json)
+          FMT=$(jq -er '.fmt' site/manifest.json)
+          FILE=$(jq -er '.file' site/manifest.json)
+          [ "$FMT" = "pma-idx/1" ] || { echo "unexpected fmt $FMT"; exit 1; }
+          [ "$FILE" = "idx-${V}.bin.gz" ] || { echo "file/v mismatch"; exit 1; }
+          test -f "site/$FILE"
+          [ "$(sha256sum "site/$FILE" | cut -c1-16)" = "$V" ] || { echo "hash mismatch"; exit 1; }
+          [ "$(ls site | wc -l)" = "2" ] || { echo "unexpected extra files"; ls site; exit 1; }
+          gzip -t "site/$FILE"
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Compare with live manifest
+        id: compare
+        env:
+          NEW_V: ${{ steps.new.outputs.v }}
+        run: |
+          BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          LIVE=$(curl -fsS --max-time 20 "${BASE}/manifest.json?cb=$(date +%s)" | jq -r '.v // "none"' 2>/dev/null || echo none)
+          echo "live v=${LIVE} new v=${NEW_V}"
+          if [ "$LIVE" = "$NEW_V" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "### ℹ️ Live index already at v=${NEW_V} — deploy skipped" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Pages artifact
+        if: steps.compare.outputs.skip != 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+          retention-days: 1
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Summary
+        run: echo "### ✅ Published ${{ steps.deployment.outputs.page_url }}manifest.json" >> "$GITHUB_STEP_SUMMARY"
