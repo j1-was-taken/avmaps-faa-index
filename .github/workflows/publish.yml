@@ -1,9 +1,13 @@
 name: Publish PMA index
 
-# Public repo avmaps-pma-index. Triggered by the avmaps import workflow
-# (repository_dispatch) right after it uploads the `pma-index` artifact.
+# Public repo avmaps-pma-index  →  .github/workflows/publish.yml
+# Triggered by the avmaps import workflow (repository_dispatch) right after it
+# uploads the `pma-index` artifact.
 # Serves  https://<owner>.github.io/avmaps-pma-index/manifest.json
 #         https://<owner>.github.io/avmaps-pma-index/idx-<v>.bin.gz
+#
+# `v` is the first 16 hex of sha256 of the RAW (gunzipped) bin, never of the .gz
+# (gzip bytes depend on the runner's zlib build). Validate accordingly.
 on:
   repository_dispatch:
     types: [pma-index-built]
@@ -13,7 +17,7 @@ on:
         description: "Source repo (owner/name), e.g. owner/avmaps"
         required: true
       run_id:
-        description: "Run id of the import workflow that uploaded pma-index (artifact lives 1 day)"
+        description: "Run id of the import workflow that uploaded pma-index (artifact lives 3 days)"
         required: true
 
 concurrency:
@@ -47,15 +51,24 @@ jobs:
           V=$(jq -er '.v' site/manifest.json)
           FMT=$(jq -er '.fmt' site/manifest.json)
           FILE=$(jq -er '.file' site/manifest.json)
+          BYTES=$(jq -er '.bytes' site/manifest.json)
+          GZ=$(jq -er '.gz' site/manifest.json)
+          # Any pma-idx/<number>: the worker decides whether it supports it, so a
+          # format bump must not require editing this file in a second repo.
           case "$FMT" in
-            pma-idx/1|pma-idx/2) ;;
+            pma-idx/[0-9]*) ;;
             *) echo "unexpected fmt $FMT"; exit 1 ;;
           esac
+          [[ "$V" =~ ^[0-9a-f]{16}$ ]] || { echo "bad v"; exit 1; }
           [ "$FILE" = "idx-${V}.bin.gz" ] || { echo "file/v mismatch"; exit 1; }
           test -f "site/$FILE"
-          [ "$(sha256sum "site/$FILE" | cut -c1-16)" = "$V" ] || { echo "hash mismatch"; exit 1; }
           [ "$(ls site | wc -l)" = "2" ] || { echo "unexpected extra files"; ls site; exit 1; }
           gzip -t "site/$FILE"
+          [ "$(stat -c%s "site/$FILE")" = "$GZ" ] || { echo "gz size mismatch"; exit 1; }
+          gzip -dc "site/$FILE" > "$RUNNER_TEMP/raw.bin"
+          [ "$(stat -c%s "$RUNNER_TEMP/raw.bin")" = "$BYTES" ] || { echo "raw size mismatch"; exit 1; }
+          [ "$(sha256sum "$RUNNER_TEMP/raw.bin" | cut -c1-16)" = "$V" ] || { echo "v is not sha256 of the RAW bin"; exit 1; }
+          rm -f "$RUNNER_TEMP/raw.bin"
           echo "v=$V" >> "$GITHUB_OUTPUT"
 
       - name: Compare with live manifest
