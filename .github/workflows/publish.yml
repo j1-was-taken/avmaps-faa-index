@@ -1,10 +1,10 @@
 name: Publish PMA index
 
-# Public repo avmaps-pma-index  →  .github/workflows/publish.yml
+# Public repo avmaps-faa-index  →  .github/workflows/publish.yml
 # Triggered by the avmaps import workflow (repository_dispatch) right after it
 # uploads the `pma-index` artifact.
-# Serves  https://<owner>.github.io/avmaps-pma-index/manifest.json
-#         https://<owner>.github.io/avmaps-pma-index/idx-<v>.bin.gz
+# Serves  https://<owner>.github.io/avmaps-faa-index/manifest.json
+#         https://<owner>.github.io/avmaps-faa-index/idx-<v>.bin.gz
 #
 # `v` is the first 16 hex of sha256 of the RAW (gunzipped) bin, never of the .gz
 # (gzip bytes depend on the runner's zlib build). Validate accordingly.
