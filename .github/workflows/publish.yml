@@ -47,7 +47,10 @@ jobs:
           V=$(jq -er '.v' site/manifest.json)
           FMT=$(jq -er '.fmt' site/manifest.json)
           FILE=$(jq -er '.file' site/manifest.json)
-          [ "$FMT" = "pma-idx/1" ] || { echo "unexpected fmt $FMT"; exit 1; }
+          case "$FMT" in
+            pma-idx/1|pma-idx/2) ;;
+            *) echo "unexpected fmt $FMT"; exit 1 ;;
+          esac
           [ "$FILE" = "idx-${V}.bin.gz" ] || { echo "file/v mismatch"; exit 1; }
           test -f "site/$FILE"
           [ "$(sha256sum "site/$FILE" | cut -c1-16)" = "$V" ] || { echo "hash mismatch"; exit 1; }
