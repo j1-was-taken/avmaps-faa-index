@@ -1,71 +1,101 @@
-name: Publish PMA index
+name: Publish indexes
 
 # Public repo avmaps-faa-index  →  .github/workflows/publish.yml
-# Triggered by the avmaps import workflow (repository_dispatch) right after it
-# uploads the `pma-index` artifact.
-# Serves  https://<owner>.github.io/avmaps-faa-index/manifest.json
-#         https://<owner>.github.io/avmaps-faa-index/idx-<v>.bin.gz
+# Triggered by an avmaps import workflow (repository_dispatch, event type
+# `index-built`) right after it uploads the `<dataset>-index` artifact.
+#   client_payload: { repo: "owner/avmaps", run_id: "<import run id>", dataset: "pma|airports|tail" }
+# Serves  https://<owner>.github.io/avmaps-faa-index/<dataset>/manifest.json
+#         https://<owner>.github.io/avmaps-faa-index/<dataset>/idx-<v>.bin.gz
+#
+# A Pages deploy REPLACES the whole site. So every publish re-assembles all
+# datasets: the new one from the artifact, the others copied from the live site.
+# A live dataset that cannot be fetched fails the job (never deploy a site that
+# silently lost a dataset); a dataset that is not published yet (404) is skipped.
 #
 # `v` is the first 16 hex of sha256 of the RAW (gunzipped) bin, never of the .gz
 # (gzip bytes depend on the runner's zlib build). Validate accordingly.
+# `fmt` must be `<dataset>-idx/<number>`; the worker decides whether it supports it.
 on:
   repository_dispatch:
-    types: [pma-index-built]
+    types: [index-built]
   workflow_dispatch:
     inputs:
+      dataset:
+        description: "Dataset to publish"
+        required: true
+        type: choice
+        options: [pma, airports, tail]
       repo:
         description: "Source repo (owner/name), e.g. owner/avmaps"
         required: true
       run_id:
-        description: "Run id of the import workflow that uploaded pma-index (artifact lives 3 days)"
+        description: "Run id of the import workflow that uploaded <dataset>-index (artifact lives 3 days)"
         required: true
 
+# One publish at a time: each one assembles the site from the live copy of the
+# other datasets, so two parallel publishes would overwrite each other.
+# NOTE: GitHub keeps only ONE pending run per group; stagger the import crons.
 concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  DATASETS: "pma airports tail"
+
 jobs:
   prepare:
-    name: Download artifact → compare with live
+    name: Download artifact → compare with live → assemble site
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
       skip: ${{ steps.compare.outputs.skip }}
     steps:
-      - name: Download pma-index artifact
+      - name: Resolve dataset
+        id: ds
+        env:
+          DATASET: ${{ github.event.client_payload.dataset || inputs.dataset }}
+        run: |
+          set -euo pipefail
+          case "$DATASET" in
+            pma|airports|tail) ;;
+            *) echo "unknown dataset '$DATASET'"; exit 1 ;;
+          esac
+          echo "name=$DATASET" >> "$GITHUB_OUTPUT"
+
+      - name: Download index artifact
         uses: actions/download-artifact@v4
         with:
-          name: pma-index
-          path: site
+          name: ${{ steps.ds.outputs.name }}-index
+          path: new
           repository: ${{ github.event.client_payload.repo || inputs.repo }}
           run-id: ${{ github.event.client_payload.run_id || inputs.run_id }}
           github-token: ${{ secrets.AVMAPS_ARTIFACT_TOKEN }}
 
       - name: Validate artifact
         id: new
+        env:
+          DATASET: ${{ steps.ds.outputs.name }}
         run: |
           set -euo pipefail
-          test -f site/manifest.json
-          V=$(jq -er '.v' site/manifest.json)
-          FMT=$(jq -er '.fmt' site/manifest.json)
-          FILE=$(jq -er '.file' site/manifest.json)
-          BYTES=$(jq -er '.bytes' site/manifest.json)
-          GZ=$(jq -er '.gz' site/manifest.json)
-          # Any pma-idx/<number>: the worker decides whether it supports it, so a
-          # format bump must not require editing this file in a second repo.
+          test -f new/manifest.json
+          V=$(jq -er '.v' new/manifest.json)
+          FMT=$(jq -er '.fmt' new/manifest.json)
+          FILE=$(jq -er '.file' new/manifest.json)
+          BYTES=$(jq -er '.bytes' new/manifest.json)
+          GZ=$(jq -er '.gz' new/manifest.json)
           case "$FMT" in
-            pma-idx/[0-9]*) ;;
-            *) echo "unexpected fmt $FMT"; exit 1 ;;
+            "${DATASET}-idx/"[0-9]*) ;;
+            *) echo "unexpected fmt $FMT for dataset $DATASET"; exit 1 ;;
           esac
           [[ "$V" =~ ^[0-9a-f]{16}$ ]] || { echo "bad v"; exit 1; }
           [ "$FILE" = "idx-${V}.bin.gz" ] || { echo "file/v mismatch"; exit 1; }
-          test -f "site/$FILE"
-          [ "$(ls site | wc -l)" = "2" ] || { echo "unexpected extra files"; ls site; exit 1; }
-          gzip -t "site/$FILE"
-          [ "$(stat -c%s "site/$FILE")" = "$GZ" ] || { echo "gz size mismatch"; exit 1; }
-          gzip -dc "site/$FILE" > "$RUNNER_TEMP/raw.bin"
+          test -f "new/$FILE"
+          [ "$(ls new | wc -l)" = "2" ] || { echo "unexpected extra files"; ls new; exit 1; }
+          gzip -t "new/$FILE"
+          [ "$(stat -c%s "new/$FILE")" = "$GZ" ] || { echo "gz size mismatch"; exit 1; }
+          gzip -dc "new/$FILE" > "$RUNNER_TEMP/raw.bin"
           [ "$(stat -c%s "$RUNNER_TEMP/raw.bin")" = "$BYTES" ] || { echo "raw size mismatch"; exit 1; }
           [ "$(sha256sum "$RUNNER_TEMP/raw.bin" | cut -c1-16)" = "$V" ] || { echo "v is not sha256 of the RAW bin"; exit 1; }
           rm -f "$RUNNER_TEMP/raw.bin"
@@ -74,17 +104,44 @@ jobs:
       - name: Compare with live manifest
         id: compare
         env:
+          DATASET: ${{ steps.ds.outputs.name }}
           NEW_V: ${{ steps.new.outputs.v }}
         run: |
           BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
-          LIVE=$(curl -fsS --max-time 20 "${BASE}/manifest.json?cb=$(date +%s)" | jq -r '.v // "none"' 2>/dev/null || echo none)
-          echo "live v=${LIVE} new v=${NEW_V}"
+          LIVE=$(curl -fsS --max-time 20 "${BASE}/${DATASET}/manifest.json?cb=$(date +%s)" | jq -r '.v // "none"' 2>/dev/null || echo none)
+          echo "${DATASET}: live v=${LIVE} new v=${NEW_V}"
           if [ "$LIVE" = "$NEW_V" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "### ℹ️ Live index already at v=${NEW_V} — deploy skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ℹ️ ${DATASET} already live at v=${NEW_V} — deploy skipped" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Assemble site (new dataset + live copies of the others)
+        if: steps.compare.outputs.skip != 'true'
+        env:
+          DATASET: ${{ steps.ds.outputs.name }}
+        run: |
+          set -euo pipefail
+          BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          mkdir -p "site/${DATASET}"
+          cp new/* "site/${DATASET}/"
+          for d in $DATASETS; do
+            [ "$d" = "$DATASET" ] && continue
+            code=$(curl -sS --max-time 20 -o "$RUNNER_TEMP/m.json" -w '%{http_code}' "${BASE}/${d}/manifest.json?cb=$(date +%s)")
+            if [ "$code" = "404" ]; then echo "${d}: not published yet, skipping"; continue; fi
+            [ "$code" = "200" ] || { echo "${d}: live manifest returned HTTP ${code}"; exit 1; }
+            FILE=$(jq -er '.file' "$RUNNER_TEMP/m.json")
+            GZ=$(jq -er '.gz' "$RUNNER_TEMP/m.json")
+            [[ "$FILE" =~ ^idx-[0-9a-f]{16}\.bin\.gz$ ]] || { echo "${d}: bad file name in live manifest"; exit 1; }
+            mkdir -p "site/${d}"
+            curl -fsS --max-time 300 -o "site/${d}/${FILE}" "${BASE}/${d}/${FILE}"
+            gzip -t "site/${d}/${FILE}"
+            [ "$(stat -c%s "site/${d}/${FILE}")" = "$GZ" ] || { echo "${d}: gz size mismatch"; exit 1; }
+            cp "$RUNNER_TEMP/m.json" "site/${d}/manifest.json"
+            echo "${d}: kept live $(jq -r '.v' "$RUNNER_TEMP/m.json")"
+          done
+          find site -type f | sort
 
       - name: Upload Pages artifact
         if: steps.compare.outputs.skip != 'true'
@@ -111,4 +168,4 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Summary
-        run: echo "### ✅ Published ${{ steps.deployment.outputs.page_url }}manifest.json" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "### ✅ Published ${{ steps.deployment.outputs.page_url }}" >> "$GITHUB_STEP_SUMMARY"
