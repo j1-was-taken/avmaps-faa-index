@@ -4,13 +4,23 @@ name: Publish indexes
 # Triggered by an avmaps import workflow (repository_dispatch, event type
 # `index-built`) right after it uploads the `<dataset>-index` artifact.
 #   client_payload: { repo: "owner/avmaps", run_id: "<import run id>", dataset: "pma|airports|tail|acref|engref" }
-# Serves  https://j1-was-taken.github.io/avmaps-faa-index/<dataset>/manifest.json
+# Serves  https://j1-was-taken.github.io/avmaps-faa-index/                      (human index page)
+#         https://j1-was-taken.github.io/avmaps-faa-index/index.json            (machine index)
+#         https://j1-was-taken.github.io/avmaps-faa-index/<dataset>/manifest.json
 #         https://j1-was-taken.github.io/avmaps-faa-index/<dataset>/idx-<v>.bin.gz
 #
 # A Pages deploy REPLACES the whole site. So every publish re-assembles all
 # datasets: the new one from the artifact, the others copied from the live site.
 # A live dataset that cannot be fetched fails the job (never deploy a site that
 # silently lost a dataset); a dataset that is not published yet (404) is skipped.
+#
+# Manual runs (Actions → Publish indexes → Run workflow):
+#   • redeploy_only = true  → no artifact needed. Rebuilds the site purely from
+#                             the live copies of every dataset (use this to
+#                             refresh index.html / index.json, or to re-push
+#                             the site when nothing new exists).
+#   • force = true          → publish a dataset even if its v already matches
+#                             the live one (still needs dataset/repo/run_id).
 #
 # `v` is the first 16 hex of sha256 of the RAW (gunzipped) bin, never of the .gz
 # (gzip bytes depend on the runner's zlib build). Validate accordingly.
@@ -20,17 +30,27 @@ on:
     types: [index-built]
   workflow_dispatch:
     inputs:
+      redeploy_only:
+        description: "Redeploy only: rebuild the site from the live datasets (ignores dataset/repo/run_id)"
+        required: false
+        type: boolean
+        default: false
+      force:
+        description: "Force: deploy even if the dataset's v already matches the live one"
+        required: false
+        type: boolean
+        default: false
       dataset:
-        description: "Dataset to publish"
-        required: true
+        description: "Dataset to publish (not needed for redeploy_only)"
+        required: false
         type: choice
         options: [pma, airports, tail, acref, engref]
       repo:
-        description: "Source repo (owner/name), e.g. owner/avmaps"
-        required: true
+        description: "Source repo (owner/name), e.g. owner/avmaps (not needed for redeploy_only)"
+        required: false
       run_id:
-        description: "Run id of the import workflow that uploaded <dataset>-index (artifact lives 3 days)"
-        required: true
+        description: "Run id of the import workflow that uploaded <dataset>-index (artifact lives 3 days; not needed for redeploy_only)"
+        required: false
 
 # One publish at a time: each one assembles the site from the live copy of the
 # other datasets, so two parallel publishes would overwrite each other.
@@ -52,19 +72,32 @@ jobs:
     outputs:
       skip: ${{ steps.compare.outputs.skip }}
     steps:
-      - name: Resolve dataset
+      - name: Resolve mode and dataset
         id: ds
         env:
           DATASET: ${{ github.event.client_payload.dataset || inputs.dataset }}
+          SRC_REPO: ${{ github.event.client_payload.repo || inputs.repo }}
+          SRC_RUN: ${{ github.event.client_payload.run_id || inputs.run_id }}
+          REDEPLOY: ${{ inputs.redeploy_only }}
         run: |
           set -euo pipefail
+          if [ "$REDEPLOY" = "true" ]; then
+            echo "mode=redeploy" >> "$GITHUB_OUTPUT"
+            echo "name=" >> "$GITHUB_OUTPUT"
+            echo "### 🔁 Redeploy only: rebuilding the site from the live datasets" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           case "$DATASET" in
             pma|airports|tail|acref|engref) ;;
             *) echo "unknown dataset '$DATASET'"; exit 1 ;;
           esac
+          [ -n "$SRC_REPO" ] || { echo "repo is required unless redeploy_only is set"; exit 1; }
+          [ -n "$SRC_RUN" ] || { echo "run_id is required unless redeploy_only is set"; exit 1; }
+          echo "mode=publish" >> "$GITHUB_OUTPUT"
           echo "name=$DATASET" >> "$GITHUB_OUTPUT"
 
       - name: Download index artifact
+        if: steps.ds.outputs.mode == 'publish'
         uses: actions/download-artifact@v4
         with:
           name: ${{ steps.ds.outputs.name }}-index
@@ -75,6 +108,7 @@ jobs:
 
       - name: Validate artifact
         id: new
+        if: steps.ds.outputs.mode == 'publish'
         env:
           DATASET: ${{ steps.ds.outputs.name }}
         run: |
@@ -103,18 +137,23 @@ jobs:
 
       - name: Compare with live manifest
         id: compare
+        if: steps.ds.outputs.mode == 'publish'
         env:
           DATASET: ${{ steps.ds.outputs.name }}
           NEW_V: ${{ steps.new.outputs.v }}
+          FORCE: ${{ inputs.force }}
         run: |
           BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
           LIVE=$(curl -fsS --max-time 20 "${BASE}/${DATASET}/manifest.json?cb=$(date +%s)" | jq -r '.v // "none"' 2>/dev/null || echo none)
           echo "${DATASET}: live v=${LIVE} new v=${NEW_V}"
-          if [ "$LIVE" = "$NEW_V" ]; then
+          if [ "$LIVE" = "$NEW_V" ] && [ "$FORCE" != "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "### ℹ️ ${DATASET} already live at v=${NEW_V} — deploy skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ℹ️ ${DATASET} already live at v=${NEW_V} — deploy skipped (run with force=true to redeploy anyway)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            if [ "$LIVE" = "$NEW_V" ]; then
+              echo "### ⚠️ ${DATASET} already live at v=${NEW_V} — redeploying anyway (force)" >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
 
       - name: Assemble site (new dataset + live copies of the others)
@@ -124,8 +163,11 @@ jobs:
         run: |
           set -euo pipefail
           BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
-          mkdir -p "site/${DATASET}"
-          cp new/* "site/${DATASET}/"
+          mkdir -p site
+          if [ -n "$DATASET" ]; then
+            mkdir -p "site/${DATASET}"
+            cp new/* "site/${DATASET}/"
+          fi
           for d in $DATASETS; do
             [ "$d" = "$DATASET" ] && continue
             code=$(curl -sS --max-time 20 -o "$RUNNER_TEMP/m.json" -w '%{http_code}' "${BASE}/${d}/manifest.json?cb=$(date +%s)")
@@ -141,13 +183,17 @@ jobs:
             cp "$RUNNER_TEMP/m.json" "site/${d}/manifest.json"
             echo "${d}: kept live $(jq -r '.v' "$RUNNER_TEMP/m.json")"
           done
+          [ -n "$(find site -mindepth 1 -maxdepth 1 -type d)" ] || { echo "nothing to publish: no dataset is live and none was supplied"; exit 1; }
           find site -type f | sort
 
       - name: Generate root index
         if: steps.compare.outputs.skip != 'true'
         run: |
           set -euo pipefail
+          BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
           cd site
+
+          # Machine-readable index (shape unchanged: one key per dataset).
           echo '{}' > index.json
           for d in */; do
             d=${d%/}
@@ -155,14 +201,36 @@ jobs:
               '.[$d] = ($m[0] + {manifest: "\($d)/manifest.json", url: "\($d)/\($m[0].file)"})' \
               index.json > tmp.json && mv tmp.json index.json
           done
+
+          # Human-readable index: every link the site serves.
           {
-            echo '<!doctype html><meta charset="utf-8"><title>avmaps-faa-index</title><h1>avmaps-faa-index</h1><ul>'
+            echo '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>avmaps-faa-index</title>'
+            echo '<style>body{font:15px/1.5 system-ui,sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #ddd;vertical-align:top}code,pre{font-size:13px}pre{background:#f5f5f5;padding:.75rem;overflow:auto}</style>'
+            echo '<h1>avmaps-faa-index</h1>'
+            echo "<p>Built $(date -u +'%Y-%m-%d %H:%M UTC')</p>"
+            echo '<table><tr><th>Dataset</th><th>Version</th><th>Format</th><th>Size (gz / raw bytes)</th><th>Links</th></tr>'
             for d in */; do
               d=${d%/}
-              v=$(jq -r .v "$d/manifest.json")
-              echo "<li><a href=\"$d/manifest.json\">$d</a> (v=$v)</li>"
+              m="$d/manifest.json"
+              v=$(jq -r '.v // "?"' "$m")
+              fmt=$(jq -r '.fmt // "?"' "$m")
+              file=$(jq -r '.file // "?"' "$m")
+              gz=$(jq -r '.gz // "?"' "$m")
+              bytes=$(jq -r '.bytes // "?"' "$m")
+              echo "<tr><td><b>$d</b></td><td><code>$v</code></td><td><code>$fmt</code></td><td>$gz / $bytes</td><td><a href=\"$d/manifest.json\">manifest.json</a><br><a href=\"$d/$file\">$file</a></td></tr>"
             done
-            echo '</ul><p><a href="index.json">index.json</a></p>'
+            echo '</table>'
+            echo '<h2>Machine index</h2><ul><li><a href="index.json">index.json</a></li></ul>'
+            echo '<h2>Full URLs</h2><pre>'
+            echo "$BASE/"
+            echo "$BASE/index.json"
+            for d in */; do
+              d=${d%/}
+              file=$(jq -r '.file // "?"' "$d/manifest.json")
+              echo "$BASE/$d/manifest.json"
+              echo "$BASE/$d/$file"
+            done
+            echo '</pre>'
           } > index.html
 
       - name: Upload Pages artifact
