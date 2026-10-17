@@ -4,8 +4,8 @@ name: Publish indexes
 # Triggered by an avmaps import workflow (repository_dispatch, event type
 # `index-built`) right after it uploads the `<dataset>-index` artifact.
 #   client_payload: { repo: "owner/avmaps", run_id: "<import run id>", dataset: "pma|airports|tail|acref|engref" }
-# Serves  https://<owner>.github.io/avmaps-faa-index/<dataset>/manifest.json
-#         https://<owner>.github.io/avmaps-faa-index/<dataset>/idx-<v>.bin.gz
+# Serves  https://j1-was-taken.github.io/avmaps-faa-index/<dataset>/manifest.json
+#         https://j1-was-taken.github.io/avmaps-faa-index/<dataset>/idx-<v>.bin.gz
 #
 # A Pages deploy REPLACES the whole site. So every publish re-assembles all
 # datasets: the new one from the artifact, the others copied from the live site.
@@ -142,6 +142,28 @@ jobs:
             echo "${d}: kept live $(jq -r '.v' "$RUNNER_TEMP/m.json")"
           done
           find site -type f | sort
+
+      - name: Generate root index
+        if: steps.compare.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cd site
+          echo '{}' > index.json
+          for d in */; do
+            d=${d%/}
+            jq --arg d "$d" --slurpfile m "$d/manifest.json" \
+              '.[$d] = ($m[0] + {manifest: "\($d)/manifest.json", url: "\($d)/\($m[0].file)"})' \
+              index.json > tmp.json && mv tmp.json index.json
+          done
+          {
+            echo '<!doctype html><meta charset="utf-8"><title>avmaps-faa-index</title><h1>avmaps-faa-index</h1><ul>'
+            for d in */; do
+              d=${d%/}
+              v=$(jq -r .v "$d/manifest.json")
+              echo "<li><a href=\"$d/manifest.json\">$d</a> (v=$v)</li>"
+            done
+            echo '</ul><p><a href="index.json">index.json</a></p>'
+          } > index.html
 
       - name: Upload Pages artifact
         if: steps.compare.outputs.skip != 'true'
