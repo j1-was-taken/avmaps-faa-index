@@ -3,7 +3,7 @@ name: Publish indexes
 # Public repo avmaps-faa-index  →  .github/workflows/publish.yml
 # Triggered by an avmaps import workflow (repository_dispatch, event type
 # `index-built`) right after it uploads the `<dataset>-index` artifact.
-#   client_payload: { repo: "owner/avmaps", run_id: "<import run id>", dataset: "pma|airports|tail" }
+#   client_payload: { repo: "owner/avmaps", run_id: "<import run id>", dataset: "pma|airports|tail|acref|engref" }
 # Serves  https://<owner>.github.io/avmaps-faa-index/<dataset>/manifest.json
 #         https://<owner>.github.io/avmaps-faa-index/<dataset>/idx-<v>.bin.gz
 #
@@ -24,7 +24,7 @@ on:
         description: "Dataset to publish"
         required: true
         type: choice
-        options: [pma, airports, tail]
+        options: [pma, airports, tail, acref, engref]
       repo:
         description: "Source repo (owner/name), e.g. owner/avmaps"
         required: true
@@ -40,7 +40,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DATASETS: "pma airports tail"
+  DATASETS: "pma airports tail acref engref"
 
 jobs:
   prepare:
@@ -59,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$DATASET" in
-            pma|airports|tail) ;;
+            pma|airports|tail|acref|engref) ;;
             *) echo "unknown dataset '$DATASET'"; exit 1 ;;
           esac
           echo "name=$DATASET" >> "$GITHUB_OUTPUT"
